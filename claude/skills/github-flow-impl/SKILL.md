@@ -18,264 +18,217 @@ description: >
 | 커맨드 | 이슈 소스 | 설명 |
 |--------|-----------|------|
 | `/implement` | GitHub Projects | Todo 열 최우선 이슈 자동 선택 후 구현 |
-| `/implement #[번호]` | GitHub Issues | 특정 이슈 번호 지정 후 구현 (예: `/implement #42`) |
-| `/implement --inline` | 직접 입력 | 이슈 내용(번호·AC 포함)을 커맨드 뒤에 바로 붙여 입력하여 구현 |
-| `/impl` | GitHub Projects | `/implement` 단축어 |
-| `/impl #[번호]` | GitHub Issues | `/implement #[번호]` 단축어 |
-| `/impl --inline` | 직접 입력 | `/implement --inline` 단축어 |
-
+| `/implement #42` | GitHub Issues | 특정 이슈 번호 지정 후 구현 |
+| `/implement --inline` | 직접 입력 | 이슈 내용 입력 → GitHub 이슈 생성 → 보드 등록 → 구현 |
+| `/impl` | — | `/implement` 단축어 |
 
 ---
 
 ## Role
 
-너는 이 프로젝트의 **구현 담당 AI 개발자**다.
-GitHub Projects 보드에서 가장 높은 우선순위의 이슈를 가져와서 GitHub Flow에 따라 작업을 완료한다.
-한 번에 **하나의 이슈만** 처리한다.
+너는 이 프로젝트의 **구현 담당 AI 개발자**다. 한 번에 **하나의 이슈만** 처리한다.
 
 ---
 
-## Task Sequence
+## Step 0 — 환경 감지 (모든 모드 공통, 가장 먼저 실행)
 
-### Step 0 — 프로젝트 컨텍스트 자동 감지
-
-모든 모드 실행 전 가장 먼저 수행한다. `git`과 `gh`를 이용해 OWNER와 PROJECT_NUMBER를 자동으로 감지한다.
-
-**OWNER 감지**
-```bash
-# 1순위: git remote에서 추출
-git remote get-url origin \
-  | sed -E 's|.*github\.com[:/]([^/]+)/.*|\1|'
-
-# 위 명령이 실패할 경우 2순위: gh 인증 계정 사용
-gh api user --jq '.login'
-```
-
-**PROJECT_NUMBER 감지**
-```bash
-# 현재 repo에 연결된 Projects 목록 조회
-gh project list --owner $OWNER --format json \
-  | jq '.projects[] | {number: .number, title: .title}'
-```
-
-- 프로젝트가 **1개**이면 → 자동으로 해당 번호 사용
-- 프로젝트가 **2개 이상**이면 → 목록을 출력하고 사용자에게 선택 요청:
-  > "여러 프로젝트가 감지됐습니다. 사용할 프로젝트 번호를 선택해주세요:"
-- 프로젝트가 **0개**이면 → 중단 후 안내:
-  > "이 저장소에 연결된 GitHub Project를 찾을 수 없습니다."
-
-감지된 값은 이후 모든 단계에서 `[OWNER]`, `[PROJECT_NUMBER]`로 재사용한다.
-
----
-
-### Step 1 — 이슈 선정
-
-**모드 판별표:**
-
-| 입력 | 모드 | 동작 |
-|------|------|------|
-| `/implement` | 자동 선택 | Projects Todo 열 최상단 이슈 조회 |
-| `/implement #42` | 번호 지정 | 해당 이슈 직접 조회 |
-| `/implement --inline` | 직접 입력 | 템플릿 제시 → 사용자 입력 → GitHub 이슈 생성 |
-
----
-
-**[자동 선택 모드]** `/implement`
-```bash
-# Step 0에서 감지된 OWNER, PROJECT_NUMBER 자동 사용
-gh project item-list $PROJECT_NUMBER --owner $OWNER --format json \
-  | jq '[.items[] | select(.status == "Todo")] | first'
-```
-Todo 열이 비어있으면 → "처리할 이슈가 없습니다." 출력 후 중단.
-
----
-
-**[번호 지정 모드]** `/implement #42`
-```bash
-gh issue view 42
-```
-
----
-
-**[직접 입력 모드]** `/implement --inline [이슈 내용]`
-
-사용자가 `/implement --inline` 뒤에 이슈 내용을 자유 형식으로 바로 붙여 입력한다.
-Claude는 템플릿을 제시하지 않고 입력된 내용을 즉시 파싱하여 처리한다.
-
-**입력 예시:**
-```
-/implement --inline
-#47 로그인 페이지 구현
-
-사용자가 이메일/비밀번호로 로그인할 수 있어야 한다.
-
-AC:
-- [ ] 이메일 형식 유효성 검사
-- [ ] 로그인 실패 시 에러 메시지 표시
-- [ ] 로그인 성공 시 /dashboard로 리다이렉트
-```
-
-**Claude의 파싱 및 검증 절차:**
-
-1. **이슈 번호 확인** — 입력에서 `#숫자` 패턴을 찾는다.
-   - 있으면 → 해당 번호를 `issue_number`로 사용
-   - 없으면 → **중단 후 사용자에게 요청:**
-     > "이슈 번호가 없습니다. `#번호`를 입력에 포함해주세요. (예: `#47`)"
-
-2. **AC(수용 기준) 확인** — `AC`, `Acceptance Criteria`, `수용 기준`, `- [ ]` 등의 패턴을 찾는다.
-   - 있으면 → AC 항목 목록 추출
-   - 없으면 → **중단 후 사용자에게 요청:**
-     > "수용 기준(AC)이 없습니다. 구현 완료 조건을 항목으로 추가해주세요."
-
-3. 번호와 AC 모두 확인되면 → 이슈 번호와 파싱된 내용으로 이후 단계 진행
-   (GitHub에 별도 이슈 생성 없이 입력된 내용을 그대로 사용)
-
----
-
-추출 항목: `issue_number`, `issue_title`, `item_id`
-
----
-
-### Step 2 — 상태 변경 및 담당자 할당
-
-STATUS_FIELD_ID, PROJECT_ID, 각 열의 OPTION_ID는 아래 명령으로 자동 조회한다:
+아래 명령을 실제로 실행하여 OWNER, REPO, PROJECT_NUMBER를 확인한다.
 
 ```bash
-# 프로젝트 ID 및 상태 필드 정보 조회
-gh project field-list $PROJECT_NUMBER --owner $OWNER --format json \
-  | jq '.fields[] | select(.name == "Status") | {id: .id, options: .options}'
+git remote get-url origin
 ```
 
-조회 결과에서 `In Progress` 와 `Review` 의 option ID를 추출하여 아래 명령에 사용한다:
+위 출력에서 `github.com/OWNER/REPO` 형식으로 OWNER와 REPO를 추출한다.
+실패하면 `gh repo view --json owner,name` 으로 대체한다.
 
 ```bash
-# In Progress로 이동 (자동 감지된 값 사용)
+gh project list --owner OWNER --format json
+```
+
+프로젝트 목록을 출력하고 PROJECT_NUMBER를 확인한다.
+- 1개: 자동 사용
+- 2개 이상: 사용자에게 선택 요청
+- 0개: "연결된 프로젝트가 없습니다" 안내 후 중단
+
+---
+
+## Step 1 — 이슈 선정
+
+### 모드 A: `/implement` (자동 선택)
+
+```bash
+gh project item-list PROJECT_NUMBER --owner OWNER --format json
+```
+
+Status가 "Todo"인 첫 번째 아이템을 선택한다. 없으면 중단.
+
+### 모드 B: `/implement #42` (번호 지정)
+
+```bash
+gh issue view 42 --repo OWNER/REPO
+```
+
+### 모드 C: `/implement --inline` (직접 입력)
+
+사용자 입력에서 아래 항목을 파싱한다:
+
+- **티켓 번호**: `[T-006]`, `T-006`, `티켓 번호: [T-006]` 등 어떤 형식이든 추출. 없으면 무시.
+- **제목**: `제목:` 레이블 뒤 텍스트, 또는 첫 번째 의미 있는 줄.
+- **본문**: 상세 설명 전체.
+- **AC**: `수용 기준`, `AC:`, `- [ ]` 패턴 뒤 항목들. 없으면 본문 전체를 구현 기준으로 사용.
+
+파싱 후 **즉시** 아래 명령을 실행하여 GitHub 이슈를 생성한다:
+
+```bash
+gh issue create \
+  --repo OWNER/REPO \
+  --title "ISSUE_TITLE" \
+  --body "ISSUE_BODY"
+```
+
+- 티켓 번호가 있으면 제목 앞에 붙인다: `[T-006] TimerDisplay 컴포넌트 구현`
+- 명령 실행 후 출력된 URL에서 이슈 번호를 추출한다 (URL 마지막 숫자)
+
+이슈 생성 직후 보드에 등록한다:
+
+```bash
+gh project item-add PROJECT_NUMBER --owner OWNER --url ISSUE_URL
+```
+
+등록 후 2초 대기, 이후 아이템 ID를 조회하여 To Do 상태로 설정한다:
+
+```bash
+gh project item-list PROJECT_NUMBER --owner OWNER --format json --limit 100
+```
+
+조회된 아이템 중 방금 생성된 이슈 번호와 일치하는 항목의 ID를 찾는다.
+
+```bash
 gh project item-edit \
-  --id $ITEM_ID \
-  --field-id $STATUS_FIELD_ID \
-  --project-id $PROJECT_ID \
-  --single-select-option-id $IN_PROGRESS_OPTION_ID
+  --id ITEM_ID \
+  --field-id STATUS_FIELD_ID \
+  --project-id PROJECT_ID \
+  --single-select-option-id TODO_OPTION_ID
+```
 
-# AI(현재 인증된 계정)를 담당자로 할당
-gh issue edit $ISSUE_NUMBER --add-assignee @me
+STATUS_FIELD_ID, PROJECT_ID, TODO_OPTION_ID는 아래로 조회한다:
+
+```bash
+gh project field-list PROJECT_NUMBER --owner OWNER --format json
+gh project list --owner OWNER --format json
 ```
 
 ---
 
-### Step 3 — 브랜치 생성
+## Step 2 — In Progress 이동 및 담당자 할당
+
+모드 A/B의 경우 이슈가 보드에 없으면 Step 1 모드 C의 보드 등록 과정과 동일하게 추가한다.
 
 ```bash
-# main 최신화 후 브랜치 생성
+gh project item-edit \
+  --id ITEM_ID \
+  --field-id STATUS_FIELD_ID \
+  --project-id PROJECT_ID \
+  --single-select-option-id IN_PROGRESS_OPTION_ID
+
+gh issue edit ISSUE_NUMBER --add-assignee @me --repo OWNER/REPO
+```
+
+---
+
+## Step 3 — 브랜치 생성
+
+```bash
 git checkout main && git pull origin main
-git checkout -b feature/issue-[NUMBER]-[한두단어-요약]
+git checkout -b BRANCH_NAME
 ```
 
-브랜치 명명 규칙: `feature/issue-42-add-login-page`
-
-| 모드 | `[NUMBER]` 출처 |
-|------|----------------|
-| 자동 선택 | Projects 보드에서 조회한 이슈 번호 |
-| 번호 지정 | 커맨드에 입력한 `#번호` |
-| 직접 입력 | 사용자가 이슈 내용에 포함한 `#번호` |
-
-> **직접 입력 모드**에서는 `gh issue view`를 호출하지 않고,
-> 사용자가 입력한 내용을 이슈 본문으로 그대로 사용한다.
+브랜치 이름 규칙:
+- 티켓 번호 있음: `feature/t-006-timer-display`
+- 티켓 번호 없음: `feature/issue-42-login-page`
 
 ---
 
-### Step 4 — 코드 구현
+## Step 4 — 코드 구현
 
-- `tasks.md` (프로젝트 루트)를 읽어 전체 맥락 파악
-- 이슈의 **수용 기준(AC, Acceptance Criteria)** 을 기준으로 구현
-- 프로젝트 기존 컨벤션 **엄격히** 준수 (파일 구조, 네이밍, 포맷, import 스타일)
-- CI/CD 없이 **로컬 환경 최적화** 기준으로 작성
-
-`tasks.md`가 없으면 → 이슈 내용만으로 진행, 누락 사실을 사용자에게 고지.
-
----
-
-### Step 5 — 로컬 테스트
+먼저 프로젝트 구조를 파악한다:
 
 ```bash
-# 빌드
-npm run build       # 또는 yarn build / pnpm build 등 프로젝트에 맞게
-
-# 테스트 실행
-npm test
-
-# AC 항목 전체 충족 여부 수동 검증
+find . -type f \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.py" \) \
+  | grep -v node_modules | grep -v .git | head -30
+cat package.json 2>/dev/null || true
 ```
 
-테스트 실패 시 → 코드 수정 후 재실행. 통과 전까지 PR 생성 금지.
-1회 재시도 후에도 실패 시 → 오류 내용과 함께 사용자에게 보고 후 중단.
+AC가 있으면 AC 항목 기준으로, 없으면 이슈 설명 전체를 기준으로 구현한다.
+기존 코드 컨벤션(파일 구조, 네이밍, import 스타일)을 엄격히 준수한다.
 
 ---
 
-### Step 6 — PR 생성
+## Step 5 — 로컬 테스트
+
+```bash
+npm run build 2>/dev/null || yarn build 2>/dev/null || true
+npm test 2>/dev/null || yarn test 2>/dev/null || true
+```
+
+테스트 실패 시 코드 수정 후 재실행. 1회 재시도 후에도 실패 시 사용자에게 보고 후 중단.
+
+---
+
+## Step 6 — PR 생성 및 Review 이동
 
 ```bash
 git add -A
-git commit -m "feat: [간략한 설명] (closes #[ISSUE_NUMBER])"
-git push origin feature/issue-[NUMBER]-[요약]
+git commit -m "feat: SUMMARY (closes #ISSUE_NUMBER)"
+git push origin BRANCH_NAME
 
 gh pr create \
+  --repo OWNER/REPO \
   --base main \
-  --title "[이슈 제목] (#[ISSUE_NUMBER])" \
+  --title "ISSUE_TITLE (#ISSUE_NUMBER)" \
   --body "## Summary
-[구현 내용 요약]
+SUMMARY
 
 ## Changes
-- [변경사항 1]
-- [변경사항 2]
+- CHANGE_1
+- CHANGE_2
 
-Closes #[ISSUE_NUMBER]"
+Closes #ISSUE_NUMBER"
 ```
 
-PR 생성 후 이슈를 Review 열로 이동 (Step 2에서 조회한 값 재사용):
+PR 생성 후 Review 열로 이동:
+
 ```bash
 gh project item-edit \
-  --id $ITEM_ID \
-  --field-id $STATUS_FIELD_ID \
-  --project-id $PROJECT_ID \
-  --single-select-option-id $REVIEW_OPTION_ID
+  --id ITEM_ID \
+  --field-id STATUS_FIELD_ID \
+  --project-id PROJECT_ID \
+  --single-select-option-id REVIEW_OPTION_ID
 ```
 
 ---
 
-### Step 7 — 완료 보고
-
-작업 완료 후 아래 형식으로 보고:
+## Step 7 — 완료 보고
 
 ```
-✅ 작업 완료 보고
+✅ 작업 완료
 
-📌 이슈: #[NUMBER] [TITLE]
-🌿 브랜치: feature/issue-[NUMBER]-[요약]
-🔗 PR: [PR_URL]
-
-📋 작업 내용:
-- [주요 변경사항 1]
-- [주요 변경사항 2]
-
+📌 이슈: #ISSUE_NUMBER ISSUE_TITLE
+🌿 브랜치: BRANCH_NAME
+🔗 PR: PR_URL
 ✔️ 테스트: 통과
-📬 이슈 상태: Review로 이동 완료
+📬 상태: Review로 이동 완료
 ```
 
 ---
 
 ## Constraints
 
-- 한 번에 **하나의 이슈만** 처리
-- `gh` CLI와 `git` 명령어만 사용 (GitHub 웹 UI 사용 금지)
-- 프로젝트 기존 컨벤션 엄격히 준수
+- 한 번에 하나의 이슈만 처리
+- `gh` CLI와 `git`만 사용
 - 테스트 미통과 시 PR 생성 금지
-- CI/CD 파이프라인 설정 변경 금지
-
----
 
 ## Prerequisites
 
-실행 전 확인사항:
 - `gh auth login` 완료
-- `gh` CLI 버전 2.x 이상
-- `jq` 설치 (`brew install jq` 또는 `apt install jq`)
+- `gh` CLI 2.x 이상, `jq` 설치
