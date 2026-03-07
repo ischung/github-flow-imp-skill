@@ -50,6 +50,165 @@ gh project list --owner OWNER --format json
 - 2개 이상: 사용자에게 선택 요청
 - 0개: "연결된 프로젝트가 없습니다" 안내 후 중단
 
+### Step 0.5 — PR 머지 → Done 자동화 설정 확인 (최초 1회)
+
+> **이 단계를 생략하면 PR 머지 후 칸반 카드가 Review에 머무른다. 반드시 실행한다.**
+>
+> ⚠️ **사전 조건**: GitHub Actions가 `gh project` 명령을 실행하려면 기본 `GITHUB_TOKEN`이 아닌
+> **`project` 스코프를 포함한 PAT**가 필요하다. 아래 순서로 한 번만 설정한다:
+> 1. https://github.com/settings/tokens 에서 PAT 생성 (`project` 스코프 체크)
+> 2. 저장소 Settings → Secrets and variables → Actions → **`KANBAN_TOKEN`** 이름으로 등록
+
+마커 파일 `.github/.kanban-auto-done-configured`가 없으면 아래 자동화를 설정한다.
+
+> **핵심 원칙**: 워크플로우 파일은 **feature 브랜치가 아닌 main에 직접 커밋**해야 한다.
+> GitHub Actions는 base 브랜치(main)에 있는 워크플로우만 실행하기 때문에,
+> feature 브랜치에 커밋하면 해당 PR이 머지될 때는 아직 main에 파일이 없어 첫 번째 PR부터 동작하지 않는다.
+
+```bash
+# 이 코드는 Step 3(브랜치 생성) 이전, main 브랜치 위에서 실행한다.
+if [ ! -f ".github/.kanban-auto-done-configured" ]; then
+  echo "🔧 PR 머지 → Done 자동화 첫 설정 중..."
+
+  # ── GitHub Actions 워크플로우 파일 생성 ───────────────────────────
+  mkdir -p .github/workflows
+  cat > .github/workflows/kanban-auto-done.yml << 'GHACTIONS'
+# github-flow-impl 스킬이 자동 생성한 파일입니다.
+# PR 머지 시 본문의 "closes/fixes #N" 이슈를 칸반 Done으로 이동시킵니다.
+#
+# 필수 사전 설정:
+#   저장소 Settings → Secrets → KANBAN_TOKEN 에
+#   'project' 스코프를 포함한 PAT를 등록해야 합니다.
+#   (기본 GITHUB_TOKEN은 project 스코프가 없어 gh project 명령이 실패합니다)
+name: Kanban — Move to Done on PR Merge
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  move-to-done:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Move linked issues to Done
+        env:
+          # KANBAN_TOKEN: project 스코프를 포함한 PAT (저장소 Secrets에 등록 필요)
+          # GITHUB_TOKEN은 project 스코프가 없어 gh project 명령이 실패하므로 사용 불가
+          GH_TOKEN: ${{ secrets.KANBAN_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          KANBAN_PROJECT_NUMBER: ${{ vars.KANBAN_PROJECT_NUMBER }}
+        run: |
+          set -euo pipefail
+          # gh CLI가 GitHub Actions 환경을 감지해 $GITHUB_OUTPUT에 암묵적으로 쓰는 것을 방지
+          unset GITHUB_OUTPUT GITHUB_ENV
+
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::KANBAN_TOKEN secret이 설정되지 않았습니다."
+            echo "::error::저장소 Settings → Secrets → KANBAN_TOKEN 에 project 스코프 PAT를 등록하세요."
+            exit 1
+          fi
+
+          # PROJECT_NUMBER: 저장소 Variable이 있으면 사용, 없으면 첫 번째 프로젝트 자동 탐색
+          if [ -n "$KANBAN_PROJECT_NUMBER" ]; then
+            PROJECT_NUMBER="$KANBAN_PROJECT_NUMBER"
+          else
+            PROJECT_NUMBER=$(gh project list --owner "$OWNER" \
+              --format json --limit 1 | jq -r '.projects[0].number')
+          fi
+          echo "PROJECT_NUMBER=$PROJECT_NUMBER"
+
+          PROJECT_ID=$(gh project list --owner "$OWNER" --format json --limit 20 | \
+            jq -r ".projects[] | select(.number==($PROJECT_NUMBER | tonumber)) | .id")
+
+          if [ -z "$PROJECT_ID" ]; then
+            echo "::error::프로젝트 ID를 찾을 수 없습니다. OWNER=$OWNER, PROJECT_NUMBER=$PROJECT_NUMBER"
+            exit 1
+          fi
+          echo "PROJECT_ID=$PROJECT_ID"
+
+          FIELD_JSON=$(gh project field-list "$PROJECT_NUMBER" --owner "$OWNER" --format json)
+
+          STATUS_FIELD_ID=$(echo "$FIELD_JSON" | \
+            jq -r '.fields[] | select(.name=="Status") | .id')
+          DONE_OPTION_ID=$(echo "$FIELD_JSON" | \
+            jq -r '.fields[] | select(.name=="Status") | .options[] | select(.name=="Done") | .id')
+
+          if [ -z "$STATUS_FIELD_ID" ] || [ -z "$DONE_OPTION_ID" ]; then
+            echo "::error::Status 필드 또는 Done 옵션을 찾을 수 없습니다."
+            echo "STATUS_FIELD_ID=$STATUS_FIELD_ID, DONE_OPTION_ID=$DONE_OPTION_ID"
+            exit 1
+          fi
+          echo "STATUS_FIELD_ID=$STATUS_FIELD_ID, DONE_OPTION_ID=$DONE_OPTION_ID"
+
+          # PR 본문에서 이슈 번호 추출 (closes/fixes/resolves #N)
+          ISSUE_NUMBERS=$(echo "$PR_BODY" | \
+            grep -oiE '(closes?|fixes?|resolves?)[[:space:]]+#[0-9]+' | \
+            grep -oE '[0-9]+$' || true)
+
+          if [ -z "$ISSUE_NUMBERS" ]; then
+            echo "링크된 이슈 없음. 종료."
+            exit 0
+          fi
+          echo "추출된 이슈 번호: $ISSUE_NUMBERS"
+
+          for ISSUE_NUM in $ISSUE_NUMBERS; do
+            echo "이슈 #$ISSUE_NUM → Done 이동 중..."
+
+            # gh project item-list는 내부 GraphQL 쿼리에 $issueNum 버그가 있어
+            # gh api graphql 로 직접 조회 (organization → user 순으로 시도)
+            ITEM_ID=$(
+              gh api graphql \
+                -f query='query($owner:String!,$num:Int!){organization(login:$owner){projectV2(number:$num){items(first:200){nodes{id content{...on Issue{number}}}}}}}' \
+                -f owner="$OWNER" -F num="$PROJECT_NUMBER" 2>/dev/null | \
+              jq -r --argjson n "$ISSUE_NUM" \
+                '(.data.organization.projectV2.items.nodes // [])[] | select(.content.number == $n) | .id'
+            )
+            if [ -z "$ITEM_ID" ]; then
+              ITEM_ID=$(
+                gh api graphql \
+                  -f query='query($owner:String!,$num:Int!){user(login:$owner){projectV2(number:$num){items(first:200){nodes{id content{...on Issue{number}}}}}}}' \
+                  -f owner="$OWNER" -F num="$PROJECT_NUMBER" | \
+                jq -r --argjson n "$ISSUE_NUM" \
+                  '(.data.user.projectV2.items.nodes // [])[] | select(.content.number == $n) | .id'
+              )
+            fi
+
+            if [ -z "$ITEM_ID" ]; then
+              echo "  ⚠️  이슈 #$ISSUE_NUM 가 프로젝트에 없음, 건너뜀"
+              continue
+            fi
+            echo "  ITEM_ID=$ITEM_ID"
+
+            gh project item-edit \
+              --project-id "$PROJECT_ID" \
+              --id "$ITEM_ID" \
+              --field-id "$STATUS_FIELD_ID" \
+              --single-select-option-id "$DONE_OPTION_ID"
+            echo "  ✅ 이슈 #$ISSUE_NUM Done 이동 완료"
+          done
+GHACTIONS
+
+  # ── 마커 파일 생성 (중복 설정 방지) ─────────────────────────────
+  echo "configured $(date -u +%Y-%m-%dT%H:%M:%SZ)" > .github/.kanban-auto-done-configured
+
+  # ── main에 직접 커밋 & 푸시 (feature 브랜치 생성 전에 반드시 실행) ──
+  # GitHub Actions는 base 브랜치(main)의 워크플로우 파일만 실행한다.
+  # feature 브랜치에 넣으면 첫 번째 PR 머지 시 파일이 아직 main에 없어 동작하지 않는다.
+  git add .github/workflows/kanban-auto-done.yml .github/.kanban-auto-done-configured
+  git commit -m "chore: add kanban PR-merge-to-done automation"
+  git push origin main
+
+  echo ""
+  echo "✅ PR 머지 → Done 자동화 설정 완료 (main에 직접 커밋됨)"
+  echo "   · .github/workflows/kanban-auto-done.yml → main 브랜치에 푸시"
+  echo "   💡 PR 본문에 'Closes #이슈번호'를 포함하면 머지 시 자동으로 Done으로 이동합니다."
+  echo "   ⚠️  secrets.KANBAN_TOKEN 미설정 시 Actions 실행 시 오류 발생합니다."
+fi
+```
+
 ---
 
 ## Step 1 — 이슈 선정
@@ -196,6 +355,9 @@ SUMMARY
 Closes #ISSUE_NUMBER"
 ```
 
+> **중요**: PR 본문에 반드시 `Closes #ISSUE_NUMBER` 형식을 포함한다.
+> 이 키워드가 없으면 PR 머지 시 이슈가 자동으로 닫히지 않아 Done 자동 이동이 동작하지 않는다.
+
 PR 생성 후 Review 열로 이동:
 
 ```bash
@@ -218,6 +380,7 @@ gh project item-edit \
 🔗 PR: PR_URL
 ✔️ 테스트: 통과
 📬 상태: Review로 이동 완료
+🤖 자동화: PR 머지 시 'Closes #ISSUE_NUMBER' 키워드에 의해 Done으로 자동 이동됩니다
 ```
 
 ---

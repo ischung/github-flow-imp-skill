@@ -1,0 +1,116 @@
+# github-flow-impl 스킬이 자동 생성한 파일입니다.
+# PR 머지 시 본문의 "closes/fixes #N" 이슈를 칸반 Done으로 이동시킵니다.
+#
+# 필수 사전 설정:
+#   저장소 Settings → Secrets → KANBAN_TOKEN 에
+#   'project' 스코프를 포함한 PAT를 등록해야 합니다.
+#   (기본 GITHUB_TOKEN은 project 스코프가 없어 gh project 명령이 실패합니다)
+name: Kanban — Move to Done on PR Merge
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  move-to-done:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Move linked issues to Done
+        env:
+          # KANBAN_TOKEN: project 스코프를 포함한 PAT (저장소 Secrets에 등록 필요)
+          # GITHUB_TOKEN은 project 스코프가 없어 gh project 명령이 실패하므로 사용 불가
+          GH_TOKEN: ${{ secrets.KANBAN_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          KANBAN_PROJECT_NUMBER: ${{ vars.KANBAN_PROJECT_NUMBER }}
+        run: |
+          set -euo pipefail
+          # gh CLI가 GitHub Actions 환경을 감지해 $GITHUB_OUTPUT에 암묵적으로 쓰는 것을 방지
+          unset GITHUB_OUTPUT GITHUB_ENV
+
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::KANBAN_TOKEN secret이 설정되지 않았습니다."
+            echo "::error::저장소 Settings → Secrets → KANBAN_TOKEN 에 project 스코프 PAT를 등록하세요."
+            exit 1
+          fi
+
+          # PROJECT_NUMBER: 저장소 Variable이 있으면 사용, 없으면 첫 번째 프로젝트 자동 탐색
+          if [ -n "$KANBAN_PROJECT_NUMBER" ]; then
+            PROJECT_NUMBER="$KANBAN_PROJECT_NUMBER"
+          else
+            PROJECT_NUMBER=$(gh project list --owner "$OWNER" \
+              --format json --limit 1 | jq -r '.projects[0].number')
+          fi
+          echo "PROJECT_NUMBER=$PROJECT_NUMBER"
+
+          PROJECT_ID=$(gh project list --owner "$OWNER" --format json --limit 20 | \
+            jq -r ".projects[] | select(.number==($PROJECT_NUMBER | tonumber)) | .id")
+
+          if [ -z "$PROJECT_ID" ]; then
+            echo "::error::프로젝트 ID를 찾을 수 없습니다. OWNER=$OWNER, PROJECT_NUMBER=$PROJECT_NUMBER"
+            exit 1
+          fi
+          echo "PROJECT_ID=$PROJECT_ID"
+
+          FIELD_JSON=$(gh project field-list "$PROJECT_NUMBER" --owner "$OWNER" --format json)
+
+          STATUS_FIELD_ID=$(echo "$FIELD_JSON" | \
+            jq -r '.fields[] | select(.name=="Status") | .id')
+          DONE_OPTION_ID=$(echo "$FIELD_JSON" | \
+            jq -r '.fields[] | select(.name=="Status") | .options[] | select(.name=="Done") | .id')
+
+          if [ -z "$STATUS_FIELD_ID" ] || [ -z "$DONE_OPTION_ID" ]; then
+            echo "::error::Status 필드 또는 Done 옵션을 찾을 수 없습니다."
+            echo "STATUS_FIELD_ID=$STATUS_FIELD_ID, DONE_OPTION_ID=$DONE_OPTION_ID"
+            exit 1
+          fi
+          echo "STATUS_FIELD_ID=$STATUS_FIELD_ID, DONE_OPTION_ID=$DONE_OPTION_ID"
+
+          # PR 본문에서 이슈 번호 추출 (closes/fixes/resolves #N)
+          ISSUE_NUMBERS=$(echo "$PR_BODY" | \
+            grep -oiE '(closes?|fixes?|resolves?)[[:space:]]+#[0-9]+' | \
+            grep -oE '[0-9]+$' || true)
+
+          if [ -z "$ISSUE_NUMBERS" ]; then
+            echo "링크된 이슈 없음. 종료."
+            exit 0
+          fi
+          echo "추출된 이슈 번호: $ISSUE_NUMBERS"
+
+          for ISSUE_NUM in $ISSUE_NUMBERS; do
+            echo "이슈 #$ISSUE_NUM → Done 이동 중..."
+
+            # gh project item-list는 내부 GraphQL 쿼리에 $issueNum 버그가 있어
+            # gh api graphql 로 직접 조회 (organization → user 순으로 시도)
+            ITEM_ID=$(
+              gh api graphql \
+                -f query='query($owner:String!,$num:Int!){organization(login:$owner){projectV2(number:$num){items(first:200){nodes{id content{...on Issue{number}}}}}}}' \
+                -f owner="$OWNER" -F num="$PROJECT_NUMBER" 2>/dev/null | \
+              jq -r --argjson n "$ISSUE_NUM" \
+                '(.data.organization.projectV2.items.nodes // [])[] | select(.content.number == $n) | .id'
+            )
+            if [ -z "$ITEM_ID" ]; then
+              ITEM_ID=$(
+                gh api graphql \
+                  -f query='query($owner:String!,$num:Int!){user(login:$owner){projectV2(number:$num){items(first:200){nodes{id content{...on Issue{number}}}}}}}' \
+                  -f owner="$OWNER" -F num="$PROJECT_NUMBER" | \
+                jq -r --argjson n "$ISSUE_NUM" \
+                  '(.data.user.projectV2.items.nodes // [])[] | select(.content.number == $n) | .id'
+              )
+            fi
+
+            if [ -z "$ITEM_ID" ]; then
+              echo "  ⚠️  이슈 #$ISSUE_NUM 가 프로젝트에 없음, 건너뜀"
+              continue
+            fi
+            echo "  ITEM_ID=$ITEM_ID"
+
+            gh project item-edit \
+              --project-id "$PROJECT_ID" \
+              --id "$ITEM_ID" \
+              --field-id "$STATUS_FIELD_ID" \
+              --single-select-option-id "$DONE_OPTION_ID"
+            echo "  ✅ 이슈 #$ISSUE_NUM Done 이동 완료"
+          done
