@@ -87,6 +87,52 @@ gh auth status
 gh auth refresh -s project
 ```
 
+### 4. KANBAN_TOKEN 등록 (칸반 자동화용)
+
+GitHub Actions가 칸반 보드 이슈를 자동으로 이동하려면 `project` 스코프를 포함한 PAT가 필요합니다.
+기본 `GITHUB_TOKEN`은 `project` 스코프가 없어 `gh project` 명령이 실패합니다.
+
+**Step 1 — PAT 발급**
+
+1. https://github.com/settings/tokens 접속
+2. **Generate new token → Generate new token (classic)** 클릭
+3. Note: 아무 이름이나 입력 (예: `my-kanban-pat`) — 본인 식별용 메모일 뿐
+4. Expiration: 원하는 기간 선택
+5. **`project` 스코프만 체크**
+6. **Generate token** 클릭 후 토큰 복사 (페이지를 벗어나면 다시 볼 수 없음)
+
+**Step 2 — 저장소 Secret 등록**
+
+1. 해당 저장소 → **Settings** 탭
+2. 좌측 메뉴: **Secrets and variables → Actions**
+3. **New repository secret** 클릭
+4. 입력:
+   - **Name**: `KANBAN_TOKEN` ← 이 이름이 워크플로우 코드와 일치해야 함
+   - **Secret**: Step 1에서 복사한 PAT
+5. **Add secret** 클릭
+
+> ⚠️ PAT Note(메모 이름)와 Secret Name은 **별개**입니다.
+> PAT Note는 GitHub 토큰 목록에서 구분하는 라벨이고,
+> Secret Name `KANBAN_TOKEN`은 워크플로우에서 `secrets.KANBAN_TOKEN`으로 참조하는 키입니다.
+
+**동작 확인 (선택)**
+
+```bash
+GH_TOKEN=<발급한 PAT> gh project list --owner <your-username>
+# 프로젝트 목록이 출력되면 정상
+```
+
+### 5. 칸반 보드 생성
+
+`/kanban-create` 스킬로 자동 생성하거나, 수동 생성 시 **Status 컬럼명이 정확히 일치**해야 합니다.
+
+| 컬럼명 | 비고 |
+|--------|------|
+| `Todo` | 대소문자 정확히 일치 |
+| `In Progress` | |
+| `Review` | |
+| `Done` | |
+
 ---
 
 ## 설치 방법
