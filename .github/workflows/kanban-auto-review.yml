@@ -1,0 +1,14 @@
+name: Kanban — Move to Review on PR Open
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+
+jobs:
+  move-to-review:
+    if: "!github.event.pull_request.draft"
+    uses: ./.github/workflows/_kanban-move.yml
+    with:
+      status: Review
+      pr_body: ${{ github.event.pull_request.body }}
+    secrets: inherit

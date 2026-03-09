@@ -50,9 +50,9 @@ gh project list --owner OWNER --format json
 - 2개 이상: 사용자에게 선택 요청
 - 0개: "연결된 프로젝트가 없습니다" 안내 후 중단
 
-### Step 0.5 — PR 머지 → Done 자동화 설정 확인 (최초 1회)
+### Step 0.5 — 칸반 자동화 워크플로우 설정 확인 (최초 1회)
 
-> **이 단계를 생략하면 PR 머지 후 칸반 카드가 Review에 머무른다. 반드시 실행한다.**
+> **이 단계를 생략하면 PR 오픈/머지 후 칸반 카드가 자동으로 이동하지 않는다. 반드시 실행한다.**
 >
 > ⚠️ **사전 조건**: GitHub Actions가 `gh project` 명령을 실행하려면 기본 `GITHUB_TOKEN`이 아닌
 > **`project` 스코프를 포함한 PAT**가 필요하다. 아래 순서로 한 번만 설정한다:
@@ -65,44 +65,57 @@ gh project list --owner OWNER --format json
 > GitHub Actions는 base 브랜치(main)에 있는 워크플로우만 실행하기 때문에,
 > feature 브랜치에 커밋하면 해당 PR이 머지될 때는 아직 main에 파일이 없어 첫 번째 PR부터 동작하지 않는다.
 
+생성할 파일 3개:
+- `_kanban-move.yml` — 공통 이슈 이동 로직 (reusable workflow)
+- `kanban-auto-review.yml` — PR 오픈 시 Review 이동
+- `kanban-auto-done.yml` — PR 머지 시 Done 이동
+
 ```bash
 # 이 코드는 Step 3(브랜치 생성) 이전, main 브랜치 위에서 실행한다.
 if [ ! -f ".github/.kanban-auto-done-configured" ]; then
-  echo "🔧 PR 머지 → Done 자동화 첫 설정 중..."
+  echo "🔧 칸반 자동화 첫 설정 중..."
 
-  # ── GitHub Actions 워크플로우 파일 생성 ───────────────────────────
   mkdir -p .github/workflows
-  cat > .github/workflows/kanban-auto-done.yml << 'GHACTIONS'
-# github-flow-impl 스킬이 자동 생성한 파일입니다.
-# PR 머지 시 본문의 "closes/fixes #N" 이슈를 칸반 Done으로 이동시킵니다.
+
+  # ── 1) 공통 reusable workflow ──────────────────────────────────────
+  cat > .github/workflows/_kanban-move.yml << 'GHACTIONS'
+# 재사용 가능한 공통 워크플로우 — 칸반 이슈 상태 이동
+# Secret 이름을 바꾸려면 이 파일의 secrets.KANBAN_TOKEN 한 곳만 수정하면 됩니다.
 #
 # 필수 사전 설정:
 #   저장소 Settings → Secrets → KANBAN_TOKEN 에
 #   'project' 스코프를 포함한 PAT를 등록해야 합니다.
-#   (기본 GITHUB_TOKEN은 project 스코프가 없어 gh project 명령이 실패합니다)
-name: Kanban — Move to Done on PR Merge
+#   (GITHUB_TOKEN은 project 스코프가 없어 gh project 명령이 실패합니다)
+name: Kanban — Move Issue Status (Reusable)
 
 on:
-  pull_request:
-    types: [closed]
+  workflow_call:
+    inputs:
+      status:
+        description: "이동할 칸반 컬럼 이름 (예: Review, Done)"
+        required: true
+        type: string
+      pr_body:
+        description: "PR 본문 (closes/fixes #N 파싱용)"
+        required: true
+        type: string
+    secrets:
+      KANBAN_TOKEN:
+        required: true
 
 jobs:
-  move-to-done:
-    if: github.event.pull_request.merged == true
+  move:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Move linked issues to Done
+      - name: Move linked issues to ${{ inputs.status }}
         env:
-          # KANBAN_TOKEN: project 스코프를 포함한 PAT (저장소 Secrets에 등록 필요)
-          # GITHUB_TOKEN은 project 스코프가 없어 gh project 명령이 실패하므로 사용 불가
           GH_TOKEN: ${{ secrets.KANBAN_TOKEN }}
           OWNER: ${{ github.repository_owner }}
-          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_BODY: ${{ inputs.pr_body }}
+          TARGET_STATUS: ${{ inputs.status }}
           KANBAN_PROJECT_NUMBER: ${{ vars.KANBAN_PROJECT_NUMBER }}
         run: |
           set -euo pipefail
-          # gh CLI가 GitHub Actions 환경을 감지해 $GITHUB_OUTPUT에 암묵적으로 쓰는 것을 방지
           unset GITHUB_OUTPUT GITHUB_ENV
 
           if [ -z "$GH_TOKEN" ]; then
@@ -111,7 +124,7 @@ jobs:
             exit 1
           fi
 
-          # PROJECT_NUMBER: 저장소 Variable이 있으면 사용, 없으면 첫 번째 프로젝트 자동 탐색
+          # PROJECT_NUMBER: Variable이 있으면 사용, 없으면 첫 번째 프로젝트 자동 탐색
           if [ -n "$KANBAN_PROJECT_NUMBER" ]; then
             PROJECT_NUMBER="$KANBAN_PROJECT_NUMBER"
           else
@@ -133,15 +146,16 @@ jobs:
 
           STATUS_FIELD_ID=$(echo "$FIELD_JSON" | \
             jq -r '.fields[] | select(.name=="Status") | .id')
-          DONE_OPTION_ID=$(echo "$FIELD_JSON" | \
-            jq -r '.fields[] | select(.name=="Status") | .options[] | select(.name=="Done") | .id')
+          TARGET_OPTION_ID=$(echo "$FIELD_JSON" | \
+            jq -r --arg s "$TARGET_STATUS" \
+              '.fields[] | select(.name=="Status") | .options[] | select(.name==$s) | .id')
 
-          if [ -z "$STATUS_FIELD_ID" ] || [ -z "$DONE_OPTION_ID" ]; then
-            echo "::error::Status 필드 또는 Done 옵션을 찾을 수 없습니다."
-            echo "STATUS_FIELD_ID=$STATUS_FIELD_ID, DONE_OPTION_ID=$DONE_OPTION_ID"
+          if [ -z "$STATUS_FIELD_ID" ] || [ -z "$TARGET_OPTION_ID" ]; then
+            echo "::error::Status 필드 또는 '$TARGET_STATUS' 옵션을 찾을 수 없습니다."
+            echo "STATUS_FIELD_ID=$STATUS_FIELD_ID, TARGET_OPTION_ID=$TARGET_OPTION_ID"
             exit 1
           fi
-          echo "STATUS_FIELD_ID=$STATUS_FIELD_ID, DONE_OPTION_ID=$DONE_OPTION_ID"
+          echo "STATUS_FIELD_ID=$STATUS_FIELD_ID, TARGET_OPTION_ID=$TARGET_OPTION_ID"
 
           # PR 본문에서 이슈 번호 추출 (closes/fixes/resolves #N)
           ISSUE_NUMBERS=$(echo "$PR_BODY" | \
@@ -155,7 +169,7 @@ jobs:
           echo "추출된 이슈 번호: $ISSUE_NUMBERS"
 
           for ISSUE_NUM in $ISSUE_NUMBERS; do
-            echo "이슈 #$ISSUE_NUM → Done 이동 중..."
+            echo "이슈 #$ISSUE_NUM → $TARGET_STATUS 이동 중..."
 
             # gh project item-list는 내부 GraphQL 쿼리에 $issueNum 버그가 있어
             # gh api graphql 로 직접 조회 (organization → user 순으로 시도)
@@ -186,25 +200,64 @@ jobs:
               --project-id "$PROJECT_ID" \
               --id "$ITEM_ID" \
               --field-id "$STATUS_FIELD_ID" \
-              --single-select-option-id "$DONE_OPTION_ID"
-            echo "  ✅ 이슈 #$ISSUE_NUM Done 이동 완료"
+              --single-select-option-id "$TARGET_OPTION_ID"
+            echo "  ✅ 이슈 #$ISSUE_NUM $TARGET_STATUS 이동 완료"
           done
+GHACTIONS
+
+  # ── 2) PR 오픈 → Review 이동 ──────────────────────────────────────
+  cat > .github/workflows/kanban-auto-review.yml << 'GHACTIONS'
+name: Kanban — Move to Review on PR Open
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+
+jobs:
+  move-to-review:
+    if: "!github.event.pull_request.draft"
+    uses: ./.github/workflows/_kanban-move.yml
+    with:
+      status: Review
+      pr_body: ${{ github.event.pull_request.body }}
+    secrets: inherit
+GHACTIONS
+
+  # ── 3) PR 머지 → Done 이동 ────────────────────────────────────────
+  cat > .github/workflows/kanban-auto-done.yml << 'GHACTIONS'
+name: Kanban — Move to Done on PR Merge
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  move-to-done:
+    if: github.event.pull_request.merged == true
+    uses: ./.github/workflows/_kanban-move.yml
+    with:
+      status: Done
+      pr_body: ${{ github.event.pull_request.body }}
+    secrets: inherit
 GHACTIONS
 
   # ── 마커 파일 생성 (중복 설정 방지) ─────────────────────────────
   echo "configured $(date -u +%Y-%m-%dT%H:%M:%SZ)" > .github/.kanban-auto-done-configured
 
   # ── main에 직접 커밋 & 푸시 (feature 브랜치 생성 전에 반드시 실행) ──
-  # GitHub Actions는 base 브랜치(main)의 워크플로우 파일만 실행한다.
-  # feature 브랜치에 넣으면 첫 번째 PR 머지 시 파일이 아직 main에 없어 동작하지 않는다.
-  git add .github/workflows/kanban-auto-done.yml .github/.kanban-auto-done-configured
-  git commit -m "chore: add kanban PR-merge-to-done automation"
+  git add .github/workflows/_kanban-move.yml \
+          .github/workflows/kanban-auto-review.yml \
+          .github/workflows/kanban-auto-done.yml \
+          .github/.kanban-auto-done-configured
+  git commit -m "chore: add kanban automation workflows (reusable pattern)"
   git push origin main
 
   echo ""
-  echo "✅ PR 머지 → Done 자동화 설정 완료 (main에 직접 커밋됨)"
-  echo "   · .github/workflows/kanban-auto-done.yml → main 브랜치에 푸시"
-  echo "   💡 PR 본문에 'Closes #이슈번호'를 포함하면 머지 시 자동으로 Done으로 이동합니다."
+  echo "✅ 칸반 자동화 설정 완료 (main에 직접 커밋됨)"
+  echo "   · _kanban-move.yml       → 공통 이슈 이동 로직"
+  echo "   · kanban-auto-review.yml → PR 오픈 시 Review 이동"
+  echo "   · kanban-auto-done.yml   → PR 머지 시 Done 이동"
+  echo "   💡 PR 본문에 'Closes #이슈번호'를 포함하면 자동으로 이동합니다."
   echo "   ⚠️  secrets.KANBAN_TOKEN 미설정 시 Actions 실행 시 오류 발생합니다."
 fi
 ```
