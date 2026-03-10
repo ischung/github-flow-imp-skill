@@ -72,8 +72,10 @@ gh project list --owner OWNER --format json
 
 ```bash
 # 이 코드는 Step 3(브랜치 생성) 이전, main 브랜치 위에서 실행한다.
-if [ ! -f ".github/.kanban-auto-done-configured" ]; then
-  echo "🔧 칸반 자동화 첫 설정 중..."
+# 마커 파일이 없거나, 워크플로우가 구버전(repositoryOwner 미사용)이면 재생성한다.
+if [ ! -f ".github/.kanban-auto-done-configured" ] || \
+   ! grep -q "repositoryOwner" .github/workflows/_kanban-move.yml 2>/dev/null; then
+  echo "🔧 칸반 자동화 설정 중 (신규 또는 구버전 업그레이드)..."
 
   mkdir -p .github/workflows
 
