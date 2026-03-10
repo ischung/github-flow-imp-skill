@@ -126,19 +126,19 @@ jobs:
             exit 1
           fi
 
-          # PROJECT_NUMBER: Variable이 있으면 사용, 없으면 첫 번째 프로젝트 자동 탐색
-          # repositoryOwner 를 사용하면 org/user 타입 무관하게 동작 ("unknown owner type" 방지)
+          # inline fragment 로 Organization/User 모두 처리 ("unknown owner type" 방지)
+          # RepositoryOwner 인터페이스에는 projectsV2 필드가 없으므로 inline fragment 필수
           if [ -n "$KANBAN_PROJECT_NUMBER" ]; then
             PROJECT_NUMBER="$KANBAN_PROJECT_NUMBER"
           else
             PROJECT_NUMBER=$(gh api graphql \
-              -f query='query($owner:String!){repositoryOwner(login:$owner){projectsV2(first:1,orderBy:{field:UPDATED_AT,direction:DESC}){nodes{number}}}}' \
+              -f query='query($owner:String!){repositoryOwner(login:$owner){... on Organization{projectsV2(first:1,orderBy:{field:UPDATED_AT,direction:DESC}){nodes{number}}} ... on User{projectsV2(first:1,orderBy:{field:UPDATED_AT,direction:DESC}){nodes{number}}}}}' \
               -f owner="$OWNER" | jq -r '.data.repositoryOwner.projectsV2.nodes[0].number')
           fi
           echo "PROJECT_NUMBER=$PROJECT_NUMBER"
 
           PROJECT_ID=$(gh api graphql \
-            -f query='query($owner:String!,$num:Int!){repositoryOwner(login:$owner){projectV2(number:$num){id}}}' \
+            -f query='query($owner:String!,$num:Int!){repositoryOwner(login:$owner){... on Organization{projectV2(number:$num){id}} ... on User{projectV2(number:$num){id}}}}' \
             -f owner="$OWNER" -F num="$PROJECT_NUMBER" | \
             jq -r '.data.repositoryOwner.projectV2.id')
 
@@ -149,7 +149,7 @@ jobs:
           echo "PROJECT_ID=$PROJECT_ID"
 
           FIELD_JSON=$(gh api graphql \
-            -f query='query($owner:String!,$num:Int!){repositoryOwner(login:$owner){projectV2(number:$num){fields(first:30){nodes{...on ProjectV2SingleSelectField{id name options{id name}}}}}}}' \
+            -f query='query($owner:String!,$num:Int!){repositoryOwner(login:$owner){... on Organization{projectV2(number:$num){fields(first:30){nodes{...on ProjectV2SingleSelectField{id name options{id name}}}}}} ... on User{projectV2(number:$num){fields(first:30){nodes{...on ProjectV2SingleSelectField{id name options{id name}}}}}}}}' \
             -f owner="$OWNER" -F num="$PROJECT_NUMBER")
 
           STATUS_FIELD_ID=$(echo "$FIELD_JSON" | \
@@ -179,10 +179,9 @@ jobs:
           for ISSUE_NUM in $ISSUE_NUMBERS; do
             echo "이슈 #$ISSUE_NUM → $TARGET_STATUS 이동 중..."
 
-            # repositoryOwner 로 조회 — org/user 분기 불필요
             ITEM_ID=$(
               gh api graphql \
-                -f query='query($owner:String!,$num:Int!){repositoryOwner(login:$owner){projectV2(number:$num){items(first:200){nodes{id content{...on Issue{number}}}}}}}' \
+                -f query='query($owner:String!,$num:Int!){repositoryOwner(login:$owner){... on Organization{projectV2(number:$num){items(first:200){nodes{id content{...on Issue{number}}}}}} ... on User{projectV2(number:$num){items(first:200){nodes{id content{...on Issue{number}}}}}}}}' \
                 -f owner="$OWNER" -F num="$PROJECT_NUMBER" | \
               jq -r --argjson n "$ISSUE_NUM" \
                 '(.data.repositoryOwner.projectV2.items.nodes // [])[] | select(.content.number == $n) | .id'
