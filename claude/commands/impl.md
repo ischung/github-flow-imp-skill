@@ -13,16 +13,25 @@ argument-hint: "[#이슈번호 | --inline 이슈내용]"
 
 1. `git remote get-url origin` 으로 OWNER/REPO 확인
 2. `gh project list --owner OWNER --format json` 으로 PROJECT_NUMBER 확인
-3. `gh project item-list PROJECT_NUMBER --owner OWNER --format json` 으로 Todo 첫 이슈 선택
-4. 이후 github-flow-impl 스킬의 Step 2~7 순서대로 실행
+3. github-flow-impl 스킬의 **Step 0.5** 실행 — 칸반 자동화 워크플로우 설정 확인 및 초기화
+   (PR 오픈 → Review 이동 / PR 머지 → Done 이동 GitHub Actions 설정)
+4. `gh project item-list PROJECT_NUMBER --owner OWNER --format json` 으로 Todo 첫 이슈 선택
+5. 이후 github-flow-impl 스킬의 Step 2~7 순서대로 실행
+   - **Step 6 포함**: PR 생성 후 반드시 이슈를 Review 열로 이동
+   - **PR 머지 후**: GitHub Actions(kanban-auto-done.yml)가 자동으로 Done 이동
 
 ---
 
 ## 모드 B: `#42` 형태 (번호 지정)
 
 1. `git remote get-url origin` 으로 OWNER/REPO 확인
-2. `gh issue view 42 --repo OWNER/REPO` 로 이슈 조회
-3. 이후 github-flow-impl 스킬의 Step 2~7 순서대로 실행
+2. `gh project list --owner OWNER --format json` 으로 PROJECT_NUMBER 확인
+3. github-flow-impl 스킬의 **Step 0.5** 실행 — 칸반 자동화 워크플로우 설정 확인 및 초기화
+   (PR 오픈 → Review 이동 / PR 머지 → Done 이동 GitHub Actions 설정)
+4. `gh issue view 42 --repo OWNER/REPO` 로 이슈 조회
+5. 이후 github-flow-impl 스킬의 Step 2~7 순서대로 실행
+   - **Step 6 포함**: PR 생성 후 반드시 이슈를 Review 열로 이동
+   - **PR 머지 후**: GitHub Actions(kanban-auto-done.yml)가 자동으로 Done 이동
 
 ---
 
@@ -77,4 +86,6 @@ gh project item-edit --id ITEM_ID --field-id STATUS_FIELD_ID --project-id PROJEC
 
 ### 7단계 이후
 github-flow-impl 스킬의 Step 2~7(In Progress 이동, 브랜치 생성, 구현, 테스트, PR, 완료 보고)을 순서대로 실행한다.
+- **Step 6 포함**: PR 생성 후 반드시 이슈를 Review 열로 이동
+- **PR 머지 후**: GitHub Actions(kanban-auto-done.yml)가 자동으로 Done 이동
 
