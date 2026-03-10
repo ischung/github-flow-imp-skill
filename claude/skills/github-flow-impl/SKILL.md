@@ -125,16 +125,20 @@ jobs:
           fi
 
           # PROJECT_NUMBER: Variable이 있으면 사용, 없으면 첫 번째 프로젝트 자동 탐색
+          # repositoryOwner 를 사용하면 org/user 타입 무관하게 동작 ("unknown owner type" 방지)
           if [ -n "$KANBAN_PROJECT_NUMBER" ]; then
             PROJECT_NUMBER="$KANBAN_PROJECT_NUMBER"
           else
-            PROJECT_NUMBER=$(gh project list --owner "$OWNER" \
-              --format json --limit 1 | jq -r '.projects[0].number')
+            PROJECT_NUMBER=$(gh api graphql \
+              -f query='query($owner:String!){repositoryOwner(login:$owner){projectsV2(first:1,orderBy:{field:UPDATED_AT,direction:DESC}){nodes{number}}}}' \
+              -f owner="$OWNER" | jq -r '.data.repositoryOwner.projectsV2.nodes[0].number')
           fi
           echo "PROJECT_NUMBER=$PROJECT_NUMBER"
 
-          PROJECT_ID=$(gh project list --owner "$OWNER" --format json --limit 20 | \
-            jq -r ".projects[] | select(.number==($PROJECT_NUMBER | tonumber)) | .id")
+          PROJECT_ID=$(gh api graphql \
+            -f query='query($owner:String!,$num:Int!){repositoryOwner(login:$owner){projectV2(number:$num){id}}}' \
+            -f owner="$OWNER" -F num="$PROJECT_NUMBER" | \
+            jq -r '.data.repositoryOwner.projectV2.id')
 
           if [ -z "$PROJECT_ID" ]; then
             echo "::error::프로젝트 ID를 찾을 수 없습니다. OWNER=$OWNER, PROJECT_NUMBER=$PROJECT_NUMBER"
@@ -142,13 +146,15 @@ jobs:
           fi
           echo "PROJECT_ID=$PROJECT_ID"
 
-          FIELD_JSON=$(gh project field-list "$PROJECT_NUMBER" --owner "$OWNER" --format json)
+          FIELD_JSON=$(gh api graphql \
+            -f query='query($owner:String!,$num:Int!){repositoryOwner(login:$owner){projectV2(number:$num){fields(first:30){nodes{...on ProjectV2SingleSelectField{id name options{id name}}}}}}}' \
+            -f owner="$OWNER" -F num="$PROJECT_NUMBER")
 
           STATUS_FIELD_ID=$(echo "$FIELD_JSON" | \
-            jq -r '.fields[] | select(.name=="Status") | .id')
+            jq -r '.data.repositoryOwner.projectV2.fields.nodes[] | select(.name=="Status") | .id')
           TARGET_OPTION_ID=$(echo "$FIELD_JSON" | \
             jq -r --arg s "$TARGET_STATUS" \
-              '.fields[] | select(.name=="Status") | .options[] | select(.name==$s) | .id')
+              '.data.repositoryOwner.projectV2.fields.nodes[] | select(.name=="Status") | .options[] | select(.name==$s) | .id')
 
           if [ -z "$STATUS_FIELD_ID" ] || [ -z "$TARGET_OPTION_ID" ]; then
             echo "::error::Status 필드 또는 '$TARGET_STATUS' 옵션을 찾을 수 없습니다."
@@ -171,24 +177,14 @@ jobs:
           for ISSUE_NUM in $ISSUE_NUMBERS; do
             echo "이슈 #$ISSUE_NUM → $TARGET_STATUS 이동 중..."
 
-            # gh project item-list는 내부 GraphQL 쿼리에 $issueNum 버그가 있어
-            # gh api graphql 로 직접 조회 (organization → user 순으로 시도)
+            # repositoryOwner 로 조회 — org/user 분기 불필요
             ITEM_ID=$(
               gh api graphql \
-                -f query='query($owner:String!,$num:Int!){organization(login:$owner){projectV2(number:$num){items(first:200){nodes{id content{...on Issue{number}}}}}}}' \
-                -f owner="$OWNER" -F num="$PROJECT_NUMBER" 2>/dev/null | \
+                -f query='query($owner:String!,$num:Int!){repositoryOwner(login:$owner){projectV2(number:$num){items(first:200){nodes{id content{...on Issue{number}}}}}}}' \
+                -f owner="$OWNER" -F num="$PROJECT_NUMBER" | \
               jq -r --argjson n "$ISSUE_NUM" \
-                '(.data.organization.projectV2.items.nodes // [])[] | select(.content.number == $n) | .id'
+                '(.data.repositoryOwner.projectV2.items.nodes // [])[] | select(.content.number == $n) | .id'
             )
-            if [ -z "$ITEM_ID" ]; then
-              ITEM_ID=$(
-                gh api graphql \
-                  -f query='query($owner:String!,$num:Int!){user(login:$owner){projectV2(number:$num){items(first:200){nodes{id content{...on Issue{number}}}}}}}' \
-                  -f owner="$OWNER" -F num="$PROJECT_NUMBER" | \
-                jq -r --argjson n "$ISSUE_NUM" \
-                  '(.data.user.projectV2.items.nodes // [])[] | select(.content.number == $n) | .id'
-              )
-            fi
 
             if [ -z "$ITEM_ID" ]; then
               echo "  ⚠️  이슈 #$ISSUE_NUM 가 프로젝트에 없음, 건너뜀"
