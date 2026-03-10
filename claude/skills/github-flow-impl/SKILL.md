@@ -181,7 +181,7 @@ jobs:
 
             ITEM_ID=$(
               gh api graphql \
-                -f query='query($owner:String!,$num:Int!){repositoryOwner(login:$owner){... on Organization{projectV2(number:$num){items(first:200){nodes{id content{...on Issue{number}}}}}} ... on User{projectV2(number:$num){items(first:200){nodes{id content{...on Issue{number}}}}}}}}' \
+                -f query='query($owner:String!,$num:Int!){repositoryOwner(login:$owner){... on Organization{projectV2(number:$num){items(first:100){nodes{id content{...on Issue{number}}}}}} ... on User{projectV2(number:$num){items(first:100){nodes{id content{...on Issue{number}}}}}}}}' \
                 -f owner="$OWNER" -F num="$PROJECT_NUMBER" | \
               jq -r --argjson n "$ISSUE_NUM" \
                 '(.data.repositoryOwner.projectV2.items.nodes // [])[] | select(.content.number == $n) | .id'
