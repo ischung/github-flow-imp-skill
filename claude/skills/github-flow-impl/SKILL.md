@@ -88,6 +88,13 @@ if [ ! -f ".github/.kanban-auto-done-configured" ] || \
 #   저장소 Settings → Secrets → KANBAN_TOKEN 에
 #   'project' 스코프를 포함한 PAT를 등록해야 합니다.
 #   (GITHUB_TOKEN은 project 스코프가 없어 gh project 명령이 실패합니다)
+#
+# [보안] PR 본문을 workflow input으로 전달하지 않고 API로 직접 조회합니다.
+#   이유: ${{ github.event.pull_request.body }}를 with.pr_body로 넘기면
+#         GitHub Actions expression 평가 시 PR 본문 내 특수문자/표현식이
+#         셸 명령으로 해석될 수 있습니다 (expression injection).
+#         pr_number(숫자)만 전달하고 본문은 Node.js(actions/github-script)로
+#         REST API를 통해 안전하게 문자열로 읽습니다.
 name: Kanban — Move Issue Status (Reusable)
 
 on:
@@ -97,10 +104,10 @@ on:
         description: "이동할 칸반 컬럼 이름 (예: Review, Done)"
         required: true
         type: string
-      pr_body:
-        description: "PR 본문 (closes/fixes #N 파싱용)"
+      pr_number:
+        description: "PR 번호 (API로 본문 조회하여 closes #N 파싱)"
         required: true
-        type: string
+        type: number
     secrets:
       KANBAN_TOKEN:
         required: true
@@ -110,96 +117,101 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Move linked issues to ${{ inputs.status }}
+        uses: actions/github-script@v7
         env:
-          GH_TOKEN: ${{ secrets.KANBAN_TOKEN }}
-          OWNER: ${{ github.repository_owner }}
-          PR_BODY: ${{ inputs.pr_body }}
           TARGET_STATUS: ${{ inputs.status }}
+          PR_NUMBER: ${{ inputs.pr_number }}
           KANBAN_PROJECT_NUMBER: ${{ vars.KANBAN_PROJECT_NUMBER }}
-        run: |
-          set -euo pipefail
-          unset GITHUB_OUTPUT GITHUB_ENV
+        with:
+          github-token: ${{ secrets.KANBAN_TOKEN }}
+          script: |
+            const targetStatus = process.env.TARGET_STATUS;
+            const prNumber = parseInt(process.env.PR_NUMBER, 10);
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
 
-          if [ -z "$GH_TOKEN" ]; then
-            echo "::error::KANBAN_TOKEN secret이 설정되지 않았습니다."
-            echo "::error::저장소 Settings → Secrets → KANBAN_TOKEN 에 project 스코프 PAT를 등록하세요."
-            exit 1
-          fi
+            // 1. PR 본문을 REST API로 안전하게 조회 (expression injection 없음)
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+            const prBody = pr.body || '';
 
-          # inline fragment 로 Organization/User 모두 처리 ("unknown owner type" 방지)
-          # RepositoryOwner 인터페이스에는 projectsV2 필드가 없으므로 inline fragment 필수
-          if [ -n "$KANBAN_PROJECT_NUMBER" ]; then
-            PROJECT_NUMBER="$KANBAN_PROJECT_NUMBER"
-          else
-            PROJECT_NUMBER=$(gh api graphql \
-              -f query='query($owner:String!){repositoryOwner(login:$owner){... on Organization{projectsV2(first:1,orderBy:{field:UPDATED_AT,direction:DESC}){nodes{number}}} ... on User{projectsV2(first:1,orderBy:{field:UPDATED_AT,direction:DESC}){nodes{number}}}}}' \
-              -f owner="$OWNER" | jq -r '.data.repositoryOwner.projectsV2.nodes[0].number')
-          fi
-          echo "PROJECT_NUMBER=$PROJECT_NUMBER"
+            // 2. PR 본문에서 이슈 번호 추출 (closes/fixes/resolves #N)
+            const issueNumbers = [...prBody.matchAll(/(closes?|fixes?|resolves?)\s+#(\d+)/gi)]
+              .map(m => parseInt(m[2], 10));
 
-          PROJECT_ID=$(gh api graphql \
-            -f query='query($owner:String!,$num:Int!){repositoryOwner(login:$owner){... on Organization{projectV2(number:$num){id}} ... on User{projectV2(number:$num){id}}}}' \
-            -f owner="$OWNER" -F num="$PROJECT_NUMBER" | \
-            jq -r '.data.repositoryOwner.projectV2.id')
+            if (issueNumbers.length === 0) {
+              core.info('링크된 이슈 없음. 종료.');
+              return;
+            }
+            core.info(`추출된 이슈 번호: ${issueNumbers.join(', ')}`);
 
-          if [ -z "$PROJECT_ID" ]; then
-            echo "::error::프로젝트 ID를 찾을 수 없습니다. OWNER=$OWNER, PROJECT_NUMBER=$PROJECT_NUMBER"
-            exit 1
-          fi
-          echo "PROJECT_ID=$PROJECT_ID"
+            // 3. 프로젝트 번호 결정
+            let projectNumber = parseInt(process.env.KANBAN_PROJECT_NUMBER || '0', 10);
+            if (!projectNumber) {
+              const { data: { repositoryOwner } } = await github.graphql(`
+                query($owner: String!) {
+                  repositoryOwner(login: $owner) {
+                    ... on Organization { projectsV2(first:1, orderBy:{field:UPDATED_AT, direction:DESC}) { nodes { number } } }
+                    ... on User        { projectsV2(first:1, orderBy:{field:UPDATED_AT, direction:DESC}) { nodes { number } } }
+                  }
+                }`, { owner });
+              projectNumber = repositoryOwner.projectsV2.nodes[0]?.number;
+            }
+            if (!projectNumber) { core.setFailed('프로젝트 번호를 찾을 수 없습니다.'); return; }
+            core.info(`PROJECT_NUMBER=${projectNumber}`);
 
-          FIELD_JSON=$(gh api graphql \
-            -f query='query($owner:String!,$num:Int!){repositoryOwner(login:$owner){... on Organization{projectV2(number:$num){fields(first:30){nodes{...on ProjectV2SingleSelectField{id name options{id name}}}}}} ... on User{projectV2(number:$num){fields(first:30){nodes{...on ProjectV2SingleSelectField{id name options{id name}}}}}}}}' \
-            -f owner="$OWNER" -F num="$PROJECT_NUMBER")
+            // 4. 프로젝트 ID 및 Status 필드 조회
+            const fieldData = await github.graphql(`
+              query($owner: String!, $num: Int!) {
+                repositoryOwner(login: $owner) {
+                  ... on Organization { projectV2(number: $num) { id fields(first:30) { nodes { ...on ProjectV2SingleSelectField { id name options { id name } } } } } }
+                  ... on User        { projectV2(number: $num) { id fields(first:30) { nodes { ...on ProjectV2SingleSelectField { id name options { id name } } } } } }
+                }
+              }`, { owner, num: projectNumber });
 
-          STATUS_FIELD_ID=$(echo "$FIELD_JSON" | \
-            jq -r '.data.repositoryOwner.projectV2.fields.nodes[] | select(.name=="Status") | .id')
-          TARGET_OPTION_ID=$(echo "$FIELD_JSON" | \
-            jq -r --arg s "$TARGET_STATUS" \
-              '.data.repositoryOwner.projectV2.fields.nodes[] | select(.name=="Status") | .options[] | select(.name==$s) | .id')
+            const project = fieldData.repositoryOwner.projectV2;
+            if (!project) { core.setFailed(`프로젝트 #${projectNumber}를 찾을 수 없습니다.`); return; }
 
-          if [ -z "$STATUS_FIELD_ID" ] || [ -z "$TARGET_OPTION_ID" ]; then
-            echo "::error::Status 필드 또는 '$TARGET_STATUS' 옵션을 찾을 수 없습니다."
-            echo "STATUS_FIELD_ID=$STATUS_FIELD_ID, TARGET_OPTION_ID=$TARGET_OPTION_ID"
-            exit 1
-          fi
-          echo "STATUS_FIELD_ID=$STATUS_FIELD_ID, TARGET_OPTION_ID=$TARGET_OPTION_ID"
+            const projectId = project.id;
+            const statusField = project.fields.nodes.find(f => f.name === 'Status');
+            if (!statusField) { core.setFailed('Status 필드를 찾을 수 없습니다.'); return; }
 
-          # PR 본문에서 이슈 번호 추출 (closes/fixes/resolves #N)
-          ISSUE_NUMBERS=$(echo "$PR_BODY" | \
-            grep -oiE '(closes?|fixes?|resolves?)[[:space:]]+#[0-9]+' | \
-            grep -oE '[0-9]+$' || true)
+            const statusFieldId = statusField.id;
+            const targetOption = statusField.options.find(o => o.name === targetStatus);
+            if (!targetOption) { core.setFailed(`'${targetStatus}' 옵션을 찾을 수 없습니다.`); return; }
+            const targetOptionId = targetOption.id;
+            core.info(`STATUS_FIELD_ID=${statusFieldId}, TARGET_OPTION_ID=${targetOptionId}`);
 
-          if [ -z "$ISSUE_NUMBERS" ]; then
-            echo "링크된 이슈 없음. 종료."
-            exit 0
-          fi
-          echo "추출된 이슈 번호: $ISSUE_NUMBERS"
+            // 5. 각 이슈를 대상 상태로 이동
+            for (const issueNum of issueNumbers) {
+              core.info(`이슈 #${issueNum} → ${targetStatus} 이동 중...`);
 
-          for ISSUE_NUM in $ISSUE_NUMBERS; do
-            echo "이슈 #$ISSUE_NUM → $TARGET_STATUS 이동 중..."
+              const itemData = await github.graphql(`
+                query($owner: String!, $num: Int!) {
+                  repositoryOwner(login: $owner) {
+                    ... on Organization { projectV2(number: $num) { items(first:100) { nodes { id content { ...on Issue { number } } } } } }
+                    ... on User        { projectV2(number: $num) { items(first:100) { nodes { id content { ...on Issue { number } } } } } }
+                  }
+                }`, { owner, num: projectNumber });
 
-            ITEM_ID=$(
-              gh api graphql \
-                -f query='query($owner:String!,$num:Int!){repositoryOwner(login:$owner){... on Organization{projectV2(number:$num){items(first:100){nodes{id content{...on Issue{number}}}}}} ... on User{projectV2(number:$num){items(first:100){nodes{id content{...on Issue{number}}}}}}}}' \
-                -f owner="$OWNER" -F num="$PROJECT_NUMBER" | \
-              jq -r --argjson n "$ISSUE_NUM" \
-                '(.data.repositoryOwner.projectV2.items.nodes // [])[] | select(.content.number == $n) | .id'
-            )
+              const items = itemData.repositoryOwner.projectV2?.items?.nodes || [];
+              const item = items.find(i => i.content?.number === issueNum);
+              if (!item) {
+                core.warning(`이슈 #${issueNum}가 프로젝트에 없음, 건너뜀`);
+                continue;
+              }
 
-            if [ -z "$ITEM_ID" ]; then
-              echo "  ⚠️  이슈 #$ISSUE_NUM 가 프로젝트에 없음, 건너뜀"
-              continue
-            fi
-            echo "  ITEM_ID=$ITEM_ID"
+              await github.graphql(`
+                mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: $projectId
+                    itemId: $itemId
+                    fieldId: $fieldId
+                    value: { singleSelectOptionId: $optionId }
+                  }) { projectV2Item { id } }
+                }`, { projectId, itemId: item.id, fieldId: statusFieldId, optionId: targetOptionId });
 
-            gh project item-edit \
-              --project-id "$PROJECT_ID" \
-              --id "$ITEM_ID" \
-              --field-id "$STATUS_FIELD_ID" \
-              --single-select-option-id "$TARGET_OPTION_ID"
-            echo "  ✅ 이슈 #$ISSUE_NUM $TARGET_STATUS 이동 완료"
-          done
+              core.info(`✅ 이슈 #${issueNum} ${targetStatus} 이동 완료`);
+            }
 GHACTIONS
 
   # ── 2) PR 오픈 → Review 이동 ──────────────────────────────────────
@@ -216,7 +228,7 @@ jobs:
     uses: ./.github/workflows/_kanban-move.yml
     with:
       status: Review
-      pr_body: ${{ github.event.pull_request.body }}
+      pr_number: ${{ github.event.pull_request.number }}
     secrets: inherit
 GHACTIONS
 
@@ -234,7 +246,7 @@ jobs:
     uses: ./.github/workflows/_kanban-move.yml
     with:
       status: Done
-      pr_body: ${{ github.event.pull_request.body }}
+      pr_number: ${{ github.event.pull_request.number }}
     secrets: inherit
 GHACTIONS
 

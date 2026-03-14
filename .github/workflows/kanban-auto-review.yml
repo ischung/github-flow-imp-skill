@@ -10,5 +10,5 @@ jobs:
     uses: ./.github/workflows/_kanban-move.yml
     with:
       status: Review
-      pr_body: ${{ github.event.pull_request.body }}
+      pr_number: ${{ github.event.pull_request.number }}
     secrets: inherit
