@@ -1,17 +1,12 @@
-# 재사용 가능한 공통 워크플로우 — 칸반 이슈 상태 이동
-# Secret 이름을 바꾸려면 이 파일의 secrets.KANBAN_TOKEN 한 곳만 수정하면 됩니다.
+# 재사용 가능한 공통 워크플로우 — 칸반 이슈 상태 이동 (GitHub App 방식)
 #
-# 필수 사전 설정:
-#   저장소 Settings → Secrets → KANBAN_TOKEN 에
-#   'project' 스코프를 포함한 PAT를 등록해야 합니다.
-#   (GITHUB_TOKEN은 project 스코프가 없어 gh project 명령이 실패합니다)
+# 필수 사전 설정 (저장소 Secrets):
+#   APP_ID          — GitHub App의 App ID 숫자값
+#   APP_PRIVATE_KEY — GitHub App의 Private Key (.pem 파일 전체 내용)
 #
 # [보안] PR 본문을 workflow input으로 전달하지 않고 API로 직접 조회합니다.
-#   이유: ${{ github.event.pull_request.body }}를 with.pr_body로 넘기면
-#         GitHub Actions expression 평가 시 PR 본문 내 특수문자/표현식이
-#         셸 명령으로 해석될 수 있습니다 (expression injection).
-#         pr_number(숫자)만 전달하고 본문은 Node.js(actions/github-script)로
-#         REST API를 통해 안전하게 문자열로 읽습니다.
+#   pr_number(숫자)만 전달하고 본문은 Node.js(actions/github-script)로
+#   REST API를 통해 안전하게 문자열로 읽습니다. (expression injection 방지)
 name: Kanban — Move Issue Status (Reusable)
 
 on:
@@ -26,13 +21,22 @@ on:
         required: true
         type: number
     secrets:
-      KANBAN_TOKEN:
+      APP_ID:
+        required: true
+      APP_PRIVATE_KEY:
         required: true
 
 jobs:
   move:
     runs-on: ubuntu-latest
     steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
       - name: Move linked issues to ${{ inputs.status }}
         uses: actions/github-script@v7
         env:
@@ -40,7 +44,7 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           KANBAN_PROJECT_NUMBER: ${{ vars.KANBAN_PROJECT_NUMBER }}
         with:
-          github-token: ${{ secrets.KANBAN_TOKEN }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const targetStatus = process.env.TARGET_STATUS;
             const prNumber = parseInt(process.env.PR_NUMBER, 10);

@@ -54,16 +54,30 @@ gh project list --owner OWNER --format json
 
 > **이 단계를 생략하면 PR 오픈/머지 후 칸반 카드가 자동으로 이동하지 않는다. 반드시 실행한다.**
 >
-> ⚠️ **사전 조건**: GitHub Projects API(`project` 스코프)는 기본 `GITHUB_TOKEN`으로 접근 불가.
-> `actions/github-script` + PAT 방식을 사용하며, 아래 순서로 한 번만 설정한다:
-> 1. https://github.com/settings/tokens 에서 PAT 생성 (`project` 스코프 체크)
-> 2. 저장소 Settings → Secrets and variables → Actions → **`KANBAN_TOKEN`** 이름으로 등록
+> ⚠️ **사전 조건**: GitHub App을 사용하므로 개인 PAT 불필요. 아래 순서로 한 번만 설정한다:
 >
-> ℹ️ **구버전 자동 감지**: 워크플로우가 `gh project` CLI를 직접 호출하는 구버전이면
-> `gh: set the GH_TOKEN environment variable (exit code 4)` 오류가 발생한다.
-> 이 경우 아래 조건문이 자동으로 감지하여 `actions/github-script` 기반 최신 버전으로 재생성한다.
+> **Step 1 — GitHub App 생성**
+> 1. https://github.com/settings/apps → **New GitHub App** 클릭
+> 2. App name: 임의 이름 (예: `my-kanban-bot`)
+> 3. Homepage URL: 저장소 URL 입력
+> 4. Webhook: **Active 체크 해제**
+> 5. Permissions 설정:
+>    - Repository → Issues: **Read & Write**
+>    - Repository → Pull requests: **Read-only**
+>    - Account (또는 Organization) → Projects: **Read & Write**
+> 6. Where can this be installed: **Only on this account**
+> 7. **Create GitHub App** 클릭 → App ID 메모
+> 8. Private keys 섹션 → **Generate a private key** → `.pem` 파일 다운로드
+> 9. Install App 탭 → **Install** → 대상 저장소 선택
+>
+> **Step 2 — 저장소 Secrets 등록**
+> - `APP_ID`: App ID 숫자값
+> - `APP_PRIVATE_KEY`: `.pem` 파일 전체 내용 (첫 줄 `-----BEGIN RSA PRIVATE KEY-----` 포함)
+>
+> ℹ️ **구버전 자동 감지**: 마커 파일에 `v3` 버전이 없거나 워크플로우에 `APP_ID`가 없으면
+> 아래 조건문이 자동으로 감지하여 GitHub App 기반 최신 버전으로 재생성한다.
 
-마커 파일 `.github/.kanban-auto-done-configured`가 없거나 구버전 워크플로우가 감지되면 아래 자동화를 설정한다.
+마커 파일 `.github/.kanban-auto-done-configured`에 `v3` 버전이 없거나 구버전 워크플로우가 감지되면 아래 자동화를 설정한다.
 
 > **핵심 원칙**: 워크플로우 파일은 **feature 브랜치가 아닌 main에 직접 커밋**해야 한다.
 > GitHub Actions는 base 브랜치(main)에 있는 워크플로우만 실행하기 때문에,
@@ -76,33 +90,27 @@ gh project list --owner OWNER --format json
 
 ```bash
 # 이 코드는 Step 3(브랜치 생성) 이전, main 브랜치 위에서 실행한다.
-# 아래 세 조건 중 하나라도 해당하면 워크플로우를 재생성한다.
-#   1) 마커 파일 없음 (최초 설치)
-#   2) repositoryOwner 미사용 (GraphQL 통합 이전 구버전)
-#   3) actions/github-script 미사용 (gh CLI 직접 호출 구버전 → GH_TOKEN 오류 원인)
-if [ ! -f ".github/.kanban-auto-done-configured" ] || \
-   ! grep -q "repositoryOwner" .github/workflows/_kanban-move.yml 2>/dev/null || \
-   ! grep -q "actions/github-script" .github/workflows/_kanban-move.yml 2>/dev/null; then
+# 아래 두 조건 중 하나라도 해당하면 워크플로우를 재생성한다.
+#   1) 마커 파일에 v3 버전 없음 (최초 설치 / PAT 구버전 / 이전 버전 마커)
+#   2) 워크플로우에 APP_ID 없음 (PAT 방식 구버전 — GH_TOKEN 오류 원인)
+# 버전 업 시 v3 → v4로 바꾸면 기존 배포 전체가 다음 /implement 실행 때 자동 갱신된다.
+if ! grep -q "^v3 " .github/.kanban-auto-done-configured 2>/dev/null || \
+   ! grep -q "APP_ID" .github/workflows/_kanban-move.yml 2>/dev/null; then
   echo "🔧 칸반 자동화 설정 중 (신규 또는 구버전 업그레이드)..."
 
   mkdir -p .github/workflows
 
   # ── 1) 공통 reusable workflow ──────────────────────────────────────
   cat > .github/workflows/_kanban-move.yml << 'GHACTIONS'
-# 재사용 가능한 공통 워크플로우 — 칸반 이슈 상태 이동
-# Secret 이름을 바꾸려면 이 파일의 secrets.KANBAN_TOKEN 한 곳만 수정하면 됩니다.
+# 재사용 가능한 공통 워크플로우 — 칸반 이슈 상태 이동 (GitHub App 방식)
 #
-# 필수 사전 설정:
-#   저장소 Settings → Secrets → KANBAN_TOKEN 에
-#   'project' 스코프를 포함한 PAT를 등록해야 합니다.
-#   (GITHUB_TOKEN은 project 스코프가 없어 gh project 명령이 실패합니다)
+# 필수 사전 설정 (저장소 Secrets):
+#   APP_ID          — GitHub App의 App ID 숫자값
+#   APP_PRIVATE_KEY — GitHub App의 Private Key (.pem 파일 전체 내용)
 #
 # [보안] PR 본문을 workflow input으로 전달하지 않고 API로 직접 조회합니다.
-#   이유: ${{ github.event.pull_request.body }}를 with.pr_body로 넘기면
-#         GitHub Actions expression 평가 시 PR 본문 내 특수문자/표현식이
-#         셸 명령으로 해석될 수 있습니다 (expression injection).
-#         pr_number(숫자)만 전달하고 본문은 Node.js(actions/github-script)로
-#         REST API를 통해 안전하게 문자열로 읽습니다.
+#   pr_number(숫자)만 전달하고 본문은 Node.js(actions/github-script)로
+#   REST API를 통해 안전하게 문자열로 읽습니다. (expression injection 방지)
 name: Kanban — Move Issue Status (Reusable)
 
 on:
@@ -117,13 +125,22 @@ on:
         required: true
         type: number
     secrets:
-      KANBAN_TOKEN:
+      APP_ID:
+        required: true
+      APP_PRIVATE_KEY:
         required: true
 
 jobs:
   move:
     runs-on: ubuntu-latest
     steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
       - name: Move linked issues to ${{ inputs.status }}
         uses: actions/github-script@v7
         env:
@@ -131,7 +148,7 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           KANBAN_PROJECT_NUMBER: ${{ vars.KANBAN_PROJECT_NUMBER }}
         with:
-          github-token: ${{ secrets.KANBAN_TOKEN }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const targetStatus = process.env.TARGET_STATUS;
             const prNumber = parseInt(process.env.PR_NUMBER, 10);
@@ -258,8 +275,8 @@ jobs:
     secrets: inherit
 GHACTIONS
 
-  # ── 마커 파일 생성 (중복 설정 방지) ─────────────────────────────
-  echo "configured $(date -u +%Y-%m-%dT%H:%M:%SZ)" > .github/.kanban-auto-done-configured
+  # ── 마커 파일 생성 (버전 포함 — 다음 버전 업 시 v3 → v4로만 바꾸면 됨) ──
+  echo "v3 configured $(date -u +%Y-%m-%dT%H:%M:%SZ)" > .github/.kanban-auto-done-configured
 
   # ── main에 직접 커밋 & 푸시 (feature 브랜치 생성 전에 반드시 실행) ──
   git add .github/workflows/_kanban-move.yml \
@@ -275,7 +292,7 @@ GHACTIONS
   echo "   · kanban-auto-review.yml → PR 오픈 시 Review 이동"
   echo "   · kanban-auto-done.yml   → PR 머지 시 Done 이동"
   echo "   💡 PR 본문에 'Closes #이슈번호'를 포함하면 자동으로 이동합니다."
-  echo "   ⚠️  secrets.KANBAN_TOKEN 미설정 시 Actions 실행 시 오류 발생합니다."
+  echo "   ⚠️  secrets.APP_ID / APP_PRIVATE_KEY 미설정 시 Actions 실행 시 오류 발생합니다."
 fi
 ```
 
